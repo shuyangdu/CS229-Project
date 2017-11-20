@@ -102,8 +102,13 @@ class TFBaseModel(object):
         raise NotImplementedError('subclass must implement this')
 
     def fit(self):
+        """
+        Fit the model
+        :return: 
+        """
         with self.session.as_default():
 
+            # step here is a number, but self.step is the update operation
             if self.warm_start_init_step:
                 self.restore(self.warm_start_init_step)
                 step = self.warm_start_init_step
@@ -114,6 +119,7 @@ class TFBaseModel(object):
             train_generator = self.reader.train_batch_generator(self.batch_size)
             val_generator = self.reader.val_batch_generator(self.num_validation_batches*self.batch_size)
 
+            # deque is a list-like container with fast appends and pops on either end
             train_loss_history = deque(maxlen=self.loss_averaging_window)
             val_loss_history = deque(maxlen=self.loss_averaging_window)
 
@@ -122,8 +128,11 @@ class TFBaseModel(object):
 
             while step < self.num_training_steps:
 
-                # validation evaluation
+                # ----------------- validation evaluation -----------------
                 val_batch_df = val_generator.next()
+
+                # this requires the placeholder_name in generator match the one in model attribute
+                # each batch is a dictionary with key as the placeholder_name and value as the data
                 val_feed_dict = {
                     getattr(self, placeholder_name, None): data
                     for placeholder_name, data in val_batch_df if hasattr(self, placeholder_name)
@@ -152,7 +161,7 @@ class TFBaseModel(object):
                         print 'nans', np.isnan(np_val).sum()
                         print
 
-                # train step
+                # ----------------- train step -----------------
                 train_batch_df = train_generator.next()
                 train_feed_dict = {
                     getattr(self, placeholder_name, None): data
@@ -181,6 +190,7 @@ class TFBaseModel(object):
                     ).format(step, round(avg_train_loss, 8), round(avg_val_loss, 8))
                     logging.info(metric_log)
 
+                    # update best validation loss and save model
                     if avg_val_loss < best_validation_loss:
                         best_validation_loss = avg_val_loss
                         best_validation_tstep = step
@@ -189,6 +199,7 @@ class TFBaseModel(object):
                             if self.enable_parameter_averaging:
                                 self.save(step, averaged=True)
 
+                    # early stop or restart training from last checkpoint
                     if step - best_validation_tstep > self.early_stopping_steps:
 
                         if self.num_restarts is None or restarts >= self.num_restarts:
@@ -215,10 +226,18 @@ class TFBaseModel(object):
             logging.info('num_training_steps reached - ending training')
 
     def predict(self, chunk_size=512):
+        """
+        Predict
+        :param chunk_size: chunk size for each round of prediction
+        :return: 
+        """
         if not os.path.isdir(self.prediction_dir):
             os.makedirs(self.prediction_dir)
 
+        # prediction_tensors is a dictionary defined in derived class
         if hasattr(self, 'prediction_tensors'):
+
+            # holder for numpy arrays for predict tensors, different from self.prediction_tensors
             prediction_dict = {tensor_name: [] for tensor_name in self.prediction_tensors}
 
             test_generator = self.reader.test_batch_generator(chunk_size)
@@ -233,13 +252,18 @@ class TFBaseModel(object):
                     test_feed_dict.update({self.is_training: False})
 
                 tensor_names, tf_tensors = zip(*self.prediction_tensors.items())
+
+                # run tf tensors and convert them to np arrays
                 np_tensors = self.session.run(
                     fetches=tf_tensors,
                     feed_dict=test_feed_dict
                 )
+
+                # fill the holder for numpy arrays for predict tensors
                 for tensor_name, tensor in zip(tensor_names, np_tensors):
                     prediction_dict[tensor_name].append(tensor)
 
+            # write predictions to files
             for tensor_name, tensor in prediction_dict.items():
                 np_tensor = np.concatenate(tensor, 0)
                 save_file = os.path.join(self.prediction_dir, '{}.npy'.format(tensor_name))
@@ -255,6 +279,12 @@ class TFBaseModel(object):
                 np.save(save_file, np_tensor)
 
     def save(self, step, averaged=False):
+        """
+        Save model to checkpoint
+        :param step: the training step number
+        :param averaged: 
+        :return: 
+        """
         saver = self.saver_averaged if averaged else self.saver
         checkpoint_dir = self.checkpoint_dir_averaged if averaged else self.checkpoint_dir
         if not os.path.isdir(checkpoint_dir):
@@ -266,13 +296,21 @@ class TFBaseModel(object):
         saver.save(self.session, model_path, global_step=step)
 
     def restore(self, step=None, averaged=False):
+        """
+        Restore model from checkpoint
+        :param step: 
+        :param averaged: 
+        :return: 
+        """
         saver = self.saver_averaged if averaged else self.saver
         checkpoint_dir = self.checkpoint_dir_averaged if averaged else self.checkpoint_dir
         if not step:
+            # use the latest checkpoint
             model_path = tf.train.latest_checkpoint(checkpoint_dir)
             logging.info('restoring model parameters from {}'.format(model_path))
             saver.restore(self.session, model_path)
         else:
+            # use the checkpoint at specific step
             model_path = os.path.join(
                 checkpoint_dir, 'model{}-{}'.format('_avg' if averaged else '', step)
             )
@@ -280,6 +318,11 @@ class TFBaseModel(object):
             saver.restore(self.session, model_path)
 
     def init_logging(self, log_dir):
+        """
+        Initialize the logging
+        :param log_dir: 
+        :return: 
+        """
         if not os.path.isdir(log_dir):
             os.makedirs(log_dir)
 
@@ -296,17 +339,24 @@ class TFBaseModel(object):
         logging.getLogger().addHandler(logging.StreamHandler())
 
     def update_parameters(self, loss):
-
+        """
+        Create training step to update parameters (self.step)
+        :param loss: 
+        :return: None
+        """
         if self.regularization_constant != 0:
             l2_norm = tf.reduce_sum([tf.sqrt(tf.reduce_sum(tf.square(param))) for param in tf.trainable_variables()])
             loss = loss + self.regularization_constant*l2_norm
 
         optimizer = self.get_optimizer(self.learning_rate_var)
         grads = optimizer.compute_gradients(loss)
+
+        # clip the gradients and keep the second order derivatives the same
         clipped = [(tf.clip_by_value(g, -self.grad_clip, self.grad_clip), v_) for g, v_ in grads]
 
         step = optimizer.apply_gradients(clipped, global_step=self.global_step)
 
+        # calculate the moving average of parameters
         if self.enable_parameter_averaging:
             maintain_averages_op = self.ema.apply(tf.trainable_variables())
             with tf.control_dependencies([step]):
@@ -314,6 +364,7 @@ class TFBaseModel(object):
         else:
             self.step = step
 
+        # log the info for parameters
         logging.info('all parameters:')
         logging.info(pp.pformat([(var.name, shape(var)) for var in tf.global_variables()]))
 
@@ -324,6 +375,11 @@ class TFBaseModel(object):
         logging.info(str(np.sum(np.prod(shape(var)) for var in tf.trainable_variables())))
 
     def get_optimizer(self, learning_rate):
+        """
+        Get the specified optimizer with certain learning rate
+        :param learning_rate: 
+        :return: optimizer object
+        """
         if self.optimizer == 'adam':
             return tf.train.AdamOptimizer(learning_rate)
         elif self.optimizer == 'gd':
@@ -334,12 +390,18 @@ class TFBaseModel(object):
             assert False, 'optimizer must be adam, gd, or rms'
 
     def build_graph(self):
+        """
+        High level function to build the computation graph using all components defined above
+        :return: the computation graph
+        """
         with tf.Graph().as_default() as graph:
             self.ema = tf.train.ExponentialMovingAverage(decay=0.995)
             self.global_step = tf.Variable(0, trainable=False)
             self.learning_rate_var = tf.Variable(0.0, trainable=False)
 
+            # loss defined in derived class
             self.loss = self.calculate_loss()
+
             self.update_parameters(self.loss)
 
             self.saver = tf.train.Saver(max_to_keep=1)

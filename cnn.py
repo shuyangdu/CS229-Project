@@ -103,6 +103,9 @@ class DataReader(object):
 
 
 class CNN(TFBaseModel):
+    """
+    Derived class from TFBaseModel, Dilated Causal Convolutions
+    """
 
     def __init__(
         self,
@@ -121,12 +124,26 @@ class CNN(TFBaseModel):
         super(CNN, self).__init__(**kwargs)
 
     def transform(self, x):
+        """
+        log transformation and normalization
+        :param x: 
+        :return: 
+        """
         return tf.log(x + 1) - tf.expand_dims(self.log_x_encode_mean, 1)
 
     def inverse_transform(self, x):
+        """
+        Inverse transformation
+        :param x: 
+        :return: 
+        """
         return tf.exp(x + tf.expand_dims(self.log_x_encode_mean, 1)) - 1
 
     def get_input_sequences(self):
+        """
+        Placeholder for input sequences
+        :return: 
+        """
         self.x_encode = tf.placeholder(tf.float32, [None, None])
         self.encode_len = tf.placeholder(tf.int32, [None])
         self.y_decode = tf.placeholder(tf.float32, [None, self.num_decode_steps])
@@ -146,15 +163,21 @@ class CNN(TFBaseModel):
         self.log_x_encode = self.transform(self.x_encode)
         self.x = tf.expand_dims(self.log_x_encode, 2)
 
+        # extra features in addition to time series values
+        # [batch size, max sequence length, output_units]
         self.encode_features = tf.concat([
             tf.expand_dims(self.is_nan_encode, 2),
             tf.expand_dims(tf.cast(tf.equal(self.x_encode, 0.0), tf.float32), 2),
+
+            # each time step has the same web specific features and statistics
             tf.tile(tf.reshape(self.log_x_encode_mean, (-1, 1, 1)), (1, tf.shape(self.x_encode)[1], 1)),
             tf.tile(tf.expand_dims(tf.one_hot(self.project, 9), 1), (1, tf.shape(self.x_encode)[1], 1)),
             tf.tile(tf.expand_dims(tf.one_hot(self.access, 3), 1), (1, tf.shape(self.x_encode)[1], 1)),
             tf.tile(tf.expand_dims(tf.one_hot(self.agent, 2), 1), (1, tf.shape(self.x_encode)[1], 1)),
         ], axis=2)
 
+        # use the idx of decoded series as one feature, intuitively each prediction for different idx has a unique
+        # fixed effect
         decode_idx = tf.tile(tf.expand_dims(tf.range(self.num_decode_steps), 0), (tf.shape(self.y_decode)[0], 1))
         self.decode_features = tf.concat([
             tf.one_hot(decode_idx, self.num_decode_steps),
@@ -167,8 +190,15 @@ class CNN(TFBaseModel):
         return self.x
 
     def encode(self, x, features):
+        """
+        Encode 
+        :param x: time series values
+        :param features: extra features
+        :return: 
+        """
         x = tf.concat([x, features], axis=2)
 
+        # output from time distributed dense layer, use as the input to convolution layer
         inputs = time_distributed_dense_layer(
             inputs=x,
             output_units=self.residual_channels,
@@ -178,15 +208,19 @@ class CNN(TFBaseModel):
 
         skip_outputs = []
         conv_inputs = [inputs]
+
+        # stack multiple convolutions
         for i, (dilation, filter_width) in enumerate(zip(self.dilations, self.filter_widths)):
             dilated_conv = temporal_convolution_layer(
                 inputs=inputs,
-                output_units=2*self.residual_channels,
+                output_units=2*self.residual_channels,  # double the convolution channels
                 convolution_width=filter_width,
                 causal=True,
                 dilation_rate=[dilation],
                 scope='dilated-conv-encode-{}'.format(i)
             )
+
+            # gated activation units based on output from dilated convolutions
             conv_filter, conv_gate = tf.split(dilated_conv, 2, axis=2)
             dilated_conv = tf.nn.tanh(conv_filter)*tf.nn.sigmoid(conv_gate)
 
@@ -201,6 +235,7 @@ class CNN(TFBaseModel):
             conv_inputs.append(inputs)
             skip_outputs.append(skips)
 
+        # skip connections from each layer to the final dense layer
         skip_outputs = tf.nn.relu(tf.concat(skip_outputs, axis=2))
         h = time_distributed_dense_layer(skip_outputs, 128, scope='dense-encode-1', activation=tf.nn.relu)
         y_hat = time_distributed_dense_layer(h, 1, scope='dense-encode-2')
@@ -248,6 +283,13 @@ class CNN(TFBaseModel):
         return y_hat
 
     def decode(self, x, conv_inputs, features):
+        """
+        Iteratively decode the sequence
+        :param x: 
+        :param conv_inputs: outputs from encoding convolution layers
+        :param features: decoding features
+        :return: 
+        """
         batch_size = tf.shape(x)[0]
 
         # initialize state tensor arrays
@@ -265,6 +307,8 @@ class CNN(TFBaseModel):
             slices = tf.reshape(tf.gather_nd(conv_input, idx), (batch_size, dilation, shape(conv_input, 2)))
 
             layer_ta = tf.TensorArray(dtype=tf.float32, size=dilation + self.num_decode_steps)
+
+            # unstack to TensorArray (array of tensors) in time step (dilation) dimension
             layer_ta = layer_ta.unstack(tf.transpose(slices, (1, 0, 2)))
             state_queues.append(layer_ta)
 
@@ -276,6 +320,7 @@ class CNN(TFBaseModel):
         emit_ta = tf.TensorArray(size=self.num_decode_steps, dtype=tf.float32)
 
         # initialize other loop vars
+        # a tensor with shape [batch_size] indicates whether the prediction for this series is finished or not
         elements_finished = 0 >= self.decode_len
         time = tf.constant(0, dtype=tf.int32)
 
@@ -287,6 +332,7 @@ class CNN(TFBaseModel):
             current_features = features_ta.read(time)
             current_input = tf.concat([current_input, current_features], axis=1)
 
+            # reuse the parameters initialized in the function above
             with tf.variable_scope('x-proj-decode', reuse=True):
                 w_x_proj = tf.get_variable('weights')
                 b_x_proj = tf.get_variable('biases')
@@ -334,7 +380,7 @@ class CNN(TFBaseModel):
             )
             next_elements_finished = (time >= self.decode_len - 1)
 
-            return (next_elements_finished, next_input, updated_queues)
+            return next_elements_finished, next_input, updated_queues
 
         def condition(unused_time, elements_finished, *_):
             return tf.logical_not(tf.reduce_all(elements_finished))

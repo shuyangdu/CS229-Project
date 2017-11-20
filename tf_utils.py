@@ -9,12 +9,15 @@ def temporal_convolution_layer(inputs, output_units, convolution_width, causal=F
         inputs: Tensor of shape [batch size, max sequence length, input_units].
         output_units: Output channels for convolution.
         convolution_width: Number of timesteps to use in convolution.
-        causal: Output at timestep t is a function of inputs at or before timestep t.
+        causal: Output at timestep t is a function of inputs at or before timestep t, for example see hand written draft
         dilation_rate:  Dilation rate along temporal axis.
     Returns:
         Tensor of shape [batch size, max sequence length, output_units].
     """
     with tf.variable_scope(scope, reuse=reuse):
+
+        # for causal conv, if we don't shift (pad) the input, then the padding in conv layer could make output_t rely
+        # on input_t+1 by padding zeros at the front and end of inputs
         if causal:
             shift = (convolution_width / 2) + (int(dilation_rate[0] - 1) / 2)
             pad = tf.zeros([tf.shape(inputs)[0], shift, inputs.shape.as_list()[2]])
@@ -29,6 +32,7 @@ def temporal_convolution_layer(inputs, output_units, convolution_width, causal=F
             shape=[convolution_width, shape(inputs, 2), output_units]
         )
 
+        # similar to conv1d, but tf.nn.conv1d does not support dilation rate
         z = tf.nn.convolution(inputs, W, padding='SAME', dilation_rate=dilation_rate)
         if bias:
             b = tf.get_variable(
@@ -37,8 +41,12 @@ def temporal_convolution_layer(inputs, output_units, convolution_width, causal=F
                 shape=[output_units]
             )
             z = z + b
+
+        # conv layer with padding same will produce same temporal length for the output
         z = activation(z) if activation else z
         z = tf.nn.dropout(z, dropout) if dropout is not None else z
+
+        # for causal conv, shift the output to make it have same timestamp as input
         z = z[:, :-shift, :] if causal else z
         return z
 
@@ -57,6 +65,7 @@ def time_distributed_dense_layer(inputs, output_units, bias=True, activation=Non
         Tensor of shape [batch size, max sequence length, output_units].
     """
     with tf.variable_scope(scope, reuse=reuse):
+        # each timestamp will share the dense layer, so W.shape = [input_units, output_units]
         W = tf.get_variable(
             name='weights',
             initializer=tf.random_normal_initializer(mean=0.0, stddev=1.0 / float(shape(inputs, -1))),
@@ -88,6 +97,14 @@ def shape(tensor, dim=None):
 
 
 def sequence_smape(y, y_hat, sequence_lengths, is_nan):
+    """
+    Symmetric mean absolute percentage error.
+    :param y: 
+    :param y_hat: 
+    :param sequence_lengths: 
+    :param is_nan: 
+    :return: 
+    """
     max_sequence_length = tf.shape(y)[1]
     y = tf.cast(y, tf.float32)
     smape = 2*(tf.abs(y_hat - y) / (tf.abs(y) + tf.abs(y_hat)))
