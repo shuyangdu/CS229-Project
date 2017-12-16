@@ -1,1 +1,7 @@
 Time series prediction project for course CS229 using LSTM
+Prepare a Data subdirectory with the train_2.csv and other files
+Run read_data.py
+Run gen_features.py
+Run train_eval.py
+
+Requirements - Tensorflow 1.4, Python 3.6 and CUDA GPU
